@@ -1,0 +1,75 @@
+name: Run Integration Tagged Tests
+
+permissions:
+  contents: read
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  test-integration:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+        - os: macos-latest
+          arch: arm64
+          runner: macos-latest
+          expander_leg: macos-latest--arm64
+    name: Build and Test (integration tag) [${{ matrix.expander_leg }}]
+    runs-on: ${{ matrix.runner }}
+    if: >-
+      ${{
+        github.event_name == 'workflow_dispatch' ||
+        (
+          vars.TA4J_TAGGED_TEST_INTEGRATION_SCHEDULE_ENABLED == 'true' &&
+          (
+            (vars.TA4J_TAGGED_TEST_INTEGRATION_SCHEDULE_SLOT == 'daily' && github.event.schedule
+      == '17 4 * * *') ||
+            (vars.TA4J_TAGGED_TEST_INTEGRATION_SCHEDULE_SLOT == 'weekly' && github.event.schedule
+      == '17 5 * * 1') ||
+            (vars.TA4J_TAGGED_TEST_INTEGRATION_SCHEDULE_SLOT == 'monthly' && github.event.schedule
+      == '17 6 1 * *')
+          )
+        )
+      }}
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v6
+
+    - name: Cache Maven packages
+      uses: actions/cache@v5
+      with:
+        path: ~/.m2
+        key: ${{ runner.os }}-maven-${{ hashFiles('**/pom.xml') }}
+        restore-keys: |
+          ${{ runner.os }}-maven-
+
+    - name: Set up Java
+      uses: actions/setup-java@v5
+      with:
+        distribution: temurin
+        java-version: 25
+        cache: maven
+
+    - name: Build and run integration tagged tests with Maven Wrapper
+      shell: bash
+      run: |
+        # xvfb-run only exists on Linux; it provides a virtual X display there.
+        # macOS (Quartz) and Windows (GDI) supply their own display layer, so the
+        # same test command is run directly on those runners - nothing is skipped.
+        display_wrapper=()
+        if [ "$RUNNER_OS" = "Linux" ]; then
+          if command -v xvfb-run >/dev/null 2>&1; then
+            display_wrapper=(xvfb-run)
+          else
+            echo "xvfb-run not found on this Linux runner; running without a virtual display" >&2
+          fi
+        fi
+        "${display_wrapper[@]}" ./mvnw -B test -Dgroups=integration -Dta4j.excludedTestTags=analysis-demo,benchmark,requires-display,requires-headless
+    timeout-minutes: 150
