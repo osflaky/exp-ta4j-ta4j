@@ -1,0 +1,265 @@
+/*
+ * SPDX-License-Identifier: MIT
+ */
+package org.ta4j.core.indicators;
+
+import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.assertNotSame;
+import static org.junit.Assert.assertTrue;
+import static org.ta4j.core.TestUtils.assertNumEquals;
+
+import java.time.Instant;
+
+import org.junit.Test;
+import org.ta4j.core.BarSeries;
+import org.ta4j.core.ExternalIndicatorTest;
+import org.ta4j.core.Indicator;
+import org.ta4j.core.TestUtils;
+import org.ta4j.core.indicators.averages.SMAIndicator;
+import org.ta4j.core.indicators.helpers.ClosePriceIndicator;
+import org.ta4j.core.indicators.helpers.HighPriceIndicator;
+import org.ta4j.core.indicators.helpers.LowPriceIndicator;
+import org.ta4j.core.indicators.helpers.TRIndicator;
+import org.ta4j.core.mocks.MockBarSeriesBuilder;
+import org.ta4j.core.num.Num;
+import org.ta4j.core.num.NumFactory;
+
+public class ATRIndicatorTest extends AbstractIndicatorTest<BarSeries, Num> {
+
+    private final ExternalIndicatorTest xls;
+
+    public ATRIndicatorTest(NumFactory numFactory) {
+        super((data, params) -> new ATRIndicator(data, (int) params[0]), numFactory);
+        xls = new XLSIndicatorTest(this.getClass(), "ATR.xls", 7, numFactory);
+    }
+
+    @Test
+    public void testDummy() {
+        var series = new MockBarSeriesBuilder().withNumFactory(numFactory).build();
+        var now = Instant.now();
+        series.addBar(series.barBuilder()
+                .endTime(now.minusSeconds(5))
+                .openPrice(8)
+                .closePrice(12)
+                .highPrice(15)
+                .lowPrice(8)
+                .amount(0)
+                .volume(0)
+                .build());
+        series.barBuilder()
+                .endTime(now.minusSeconds(4))
+                .openPrice(6)
+                .closePrice(8)
+                .highPrice(11)
+                .lowPrice(6)
+                .volume(0)
+                .amount(0)
+                .trades(0)
+                .add();
+        series.barBuilder()
+                .endTime(now.minusSeconds(3))
+                .openPrice(14)
+                .closePrice(15)
+                .highPrice(17)
+                .lowPrice(14)
+                .volume(0)
+                .amount(0)
+                .trades(0)
+                .add();
+        series.barBuilder()
+                .endTime(now.minusSeconds(2))
+                .openPrice(14)
+                .closePrice(15)
+                .highPrice(17)
+                .lowPrice(14)
+                .volume(0)
+                .amount(0)
+                .trades(0)
+                .add();
+        series.barBuilder()
+                .endTime(now.minusSeconds(1))
+                .openPrice(0)
+                .closePrice(0)
+                .highPrice(0)
+                .lowPrice(0)
+                .volume(0)
+                .amount(0)
+                .trades(0)
+                .add();
+        Indicator<Num> indicator = getIndicator(series, 3);
+
+        // With barCount=3, unstable period is 3, so indices 0, 1, 2 return NaN
+        assertTrue(Double.isNaN(indicator.getValue(0).doubleValue()));
+        assertTrue(Double.isNaN(indicator.getValue(1).doubleValue()));
+        assertTrue(Double.isNaN(indicator.getValue(2).doubleValue()));
+
+        // Index 3 is first valid value after unstable period - initializes to current
+        // TR value
+        // TR at index 3 = max(15-14, |15-15|, |15-15|) = 1, but we need to check actual
+        // TR value
+        Num value3 = indicator.getValue(3);
+        assertFalse(Double.isNaN(value3.doubleValue()));
+
+        // Index 4 should continue normal MMA calculation
+        assertEquals(15d / 3 + (1 - 1d / 3) * value3.doubleValue(), indicator.getValue(4).doubleValue(),
+                TestUtils.GENERAL_OFFSET);
+    }
+
+    @Test
+    public void testXls() throws Exception {
+        BarSeries xlsSeries = xls.getSeries();
+        Indicator<Num> indicator;
+
+        indicator = getIndicator(xlsSeries, 1);
+        // With barCount=1, unstable period is 1, so index 0 returns NaN
+        // The first value after unstable period initializes to current TR value, so
+        // values will differ
+        // from external data which was calculated with old behavior. Only check end
+        // value which should converge.
+        assertEquals(4.8, indicator.getValue(indicator.getBarSeries().getEndIndex()).doubleValue(),
+                TestUtils.GENERAL_OFFSET);
+
+        indicator = getIndicator(xlsSeries, 3);
+        // With barCount=3, unstable period is 3, so indices 0-2 return NaN
+        // Values after unstable period will differ initially but should converge. Only
+        // check end value.
+        assertEquals(7.4225, indicator.getValue(indicator.getBarSeries().getEndIndex()).doubleValue(),
+                TestUtils.GENERAL_OFFSET);
+
+        indicator = getIndicator(xlsSeries, 13);
+        // With barCount=13, unstable period is 13, so indices 0-12 return NaN
+        // Values after unstable period will differ initially but should converge. Only
+        // check end value.
+        assertEquals(8.8082, indicator.getValue(indicator.getBarSeries().getEndIndex()).doubleValue(),
+                TestUtils.GENERAL_OFFSET);
+    }
+
+    @Test
+    @SuppressWarnings("unchecked")
+    public void serializationRoundTrip() {
+        BarSeries series = new MockBarSeriesBuilder().withNumFactory(numFactory).withDefaultData().build();
+        ATRIndicator indicator = new ATRIndicator(series, 5);
+
+        String json = indicator.toJson();
+        Indicator<Num> restored = (Indicator<Num>) Indicator.fromJson(series, json);
+
+        assertEquals(indicator.toDescriptor(), restored.toDescriptor());
+        for (int i = series.getBeginIndex(); i <= series.getEndIndex(); i++) {
+            assertNumEquals(indicator.getValue(i), restored.getValue(i));
+        }
+    }
+
+    @Test
+    @SuppressWarnings("unchecked")
+    public void customTrueRangeSerializationRoundTripPreservesSource() {
+        BarSeries series = new MockBarSeriesBuilder().withNumFactory(numFactory).build();
+        series.barBuilder().openPrice(8).closePrice(12).highPrice(15).lowPrice(8).add();
+        series.barBuilder().openPrice(6).closePrice(8).highPrice(11).lowPrice(6).add();
+        series.barBuilder().openPrice(14).closePrice(15).highPrice(17).lowPrice(14).add();
+        series.barBuilder().openPrice(15).closePrice(16).highPrice(18).lowPrice(15).add();
+        series.barBuilder().openPrice(13).closePrice(14).highPrice(17).lowPrice(13).add();
+        series.barBuilder().openPrice(16).closePrice(18).highPrice(19).lowPrice(16).add();
+        Indicator<Num> delayedClose = new SMAIndicator(new ClosePriceIndicator(series), 2);
+        TRIndicator trueRange = new TRIndicator(new HighPriceIndicator(series), new LowPriceIndicator(series),
+                delayedClose);
+        ATRIndicator indicator = new ATRIndicator(trueRange, 3);
+        ATRIndicator defaultIndicator = new ATRIndicator(series, 3);
+
+        String json = indicator.toJson();
+        Indicator<Num> restored = (Indicator<Num>) Indicator.fromJson(series, json);
+
+        assertFalse(indicator.getValue(5).isEqual(defaultIndicator.getValue(5)));
+        assertEquals(indicator.toDescriptor(), restored.toDescriptor());
+        for (int i = series.getBeginIndex(); i <= series.getEndIndex(); i++) {
+            assertNumEquals(indicator.getValue(i), restored.getValue(i));
+        }
+    }
+
+    @Test
+    public void getTRIndicatorReturnsIndependentHelper() {
+        BarSeries series = new MockBarSeriesBuilder().withNumFactory(numFactory).withDefaultData().build();
+        ATRIndicator indicator = new ATRIndicator(series, 3);
+
+        TRIndicator first = indicator.getTRIndicator();
+        TRIndicator second = indicator.getTRIndicator();
+
+        assertNotSame(first, second);
+        assertTrue(IndicatorUtils.isSameSeries(series, first.getBarSeries()));
+        assertNumEquals(first.getValue(series.getEndIndex()), second.getValue(series.getEndIndex()));
+    }
+
+    @Test
+    public void customTrueRangeUnstableBarsAreRetained() {
+        BarSeries series = new MockBarSeriesBuilder().withNumFactory(numFactory).build();
+        series.barBuilder().openPrice(8).closePrice(12).highPrice(15).lowPrice(8).add();
+        series.barBuilder().openPrice(6).closePrice(8).highPrice(11).lowPrice(6).add();
+        series.barBuilder().openPrice(14).closePrice(15).highPrice(17).lowPrice(14).add();
+        series.barBuilder().openPrice(15).closePrice(16).highPrice(18).lowPrice(15).add();
+        series.barBuilder().openPrice(13).closePrice(14).highPrice(17).lowPrice(13).add();
+        series.barBuilder().openPrice(16).closePrice(18).highPrice(19).lowPrice(16).add();
+        Indicator<Num> delayedClose = new SMAIndicator(new ClosePriceIndicator(series), 2);
+        TRIndicator trueRange = new TRIndicator(new HighPriceIndicator(series), new LowPriceIndicator(series),
+                delayedClose);
+
+        ATRIndicator indicator = new ATRIndicator(trueRange, 3);
+
+        assertEquals(5, indicator.getCountOfUnstableBars());
+        assertTrue(Num.isNaNOrNull(indicator.getValue(4)));
+        assertFalse(Num.isNaNOrNull(indicator.getValue(5)));
+    }
+
+    @Test
+    public void headAdvanceRebuildsAverageTrueRangeFromRetainedHead() {
+        // The average true range chains every value from its predecessor, so a
+        // head advance that severs the chain must rebuild from the new first
+        // retained bar instead of serving stale chained values.
+        BarSeries series = new MockBarSeriesBuilder().withNumFactory(numFactory).build();
+        series.barBuilder().openPrice(0).closePrice(0).highPrice(0).lowPrice(-3).add();
+        series.barBuilder().openPrice(10).closePrice(10).highPrice(10).lowPrice(7).add();
+        series.barBuilder().openPrice(20).closePrice(20).highPrice(20).lowPrice(17).add();
+        series.barBuilder().openPrice(30).closePrice(30).highPrice(30).lowPrice(27).add();
+        series.barBuilder().openPrice(40).closePrice(40).highPrice(40).lowPrice(37).add();
+        series.barBuilder().openPrice(50).closePrice(50).highPrice(50).lowPrice(47).add();
+        ATRIndicator atr = new ATRIndicator(series, 2);
+        atr.getValue(5);
+
+        series.setMaximumBarCount(3);
+        assertEquals(3, series.getBeginIndex());
+
+        ATRIndicator fresh = new ATRIndicator(series, 2);
+        for (int i = 3; i <= 5; i++) {
+            assertNumEquals(fresh.getValue(i), atr.getValue(i));
+        }
+    }
+
+    @Test
+    public void headAdvanceReanchorsOuterCacheBeyondItsOwnUnstableFloor() {
+        // The average true range re-anchors its whole chain at the first retained
+        // bar, so values cached above the wrapper's own unstable-range floor
+        // (computed from the pre-advance chain) must be discarded too: the
+        // alternating true ranges keep the smoothed value distinct from a chain
+        // rebuilt at the retained head. Without the invalidation, bar 17 serves
+        // the severed chain's tail instead of the re-anchored 12.
+        BarSeries series = new MockBarSeriesBuilder().withNumFactory(numFactory).build();
+        for (int i = 0; i <= 19; i++) {
+            int closePrice = i * 10 + 5 * (i % 2);
+            series.barBuilder()
+                    .openPrice(closePrice)
+                    .closePrice(closePrice)
+                    .highPrice(closePrice + 2)
+                    .lowPrice(closePrice - 2)
+                    .add();
+        }
+        ATRIndicator atr = new ATRIndicator(series, 2);
+        atr.getValue(19);
+
+        series.setMaximumBarCount(6);
+        assertEquals(14, series.getBeginIndex());
+
+        ATRIndicator fresh = new ATRIndicator(series, 2);
+        for (int i = 16; i <= 19; i++) {
+            assertNumEquals(fresh.getValue(i), atr.getValue(i));
+        }
+    }
+}

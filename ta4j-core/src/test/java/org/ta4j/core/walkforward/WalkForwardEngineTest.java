@@ -1,0 +1,331 @@
+/*
+ * SPDX-License-Identifier: MIT
+ */
+package org.ta4j.core.walkforward;
+
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
+
+import java.util.ArrayList;
+import java.util.List;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
+
+import org.junit.jupiter.api.Test;
+import org.ta4j.core.BarSeries;
+import org.ta4j.core.mocks.MockBarSeriesBuilder;
+import org.ta4j.core.num.NumFactory;
+
+class WalkForwardEngineTest {
+
+    @Test
+    void engineBuildsSnapshotsObservationsMetricsAndAuditDeterministically() {
+        BarSeries series = new MockBarSeriesBuilder().withData(prices(220)).build();
+        NumFactory numFactory = series.numFactory();
+        WalkForwardConfig config = new WalkForwardConfig(80, 30, 30, 2, 2, 0, 5, List.of(3), 2, List.of(1), 7L);
+
+        List<WalkForwardRunResult.LeakageAudit> auditRecords = new ArrayList<>();
+        PredictionProvider<String, String> provider = (fullSeries, decisionIndex,
+                context) -> samplePredictions(numFactory, context);
+
+        OutcomeLabeler<String, Boolean> labeler = (fullSeries, decisionIndex, horizonBars, prediction) -> {
+            double start = fullSeries.getBar(decisionIndex).getClosePrice().doubleValue();
+            double end = fullSeries.getBar(decisionIndex + horizonBars).getClosePrice().doubleValue();
+            boolean movedUp = end > start;
+            return "bull".equals(prediction.payload()) ? movedUp : !movedUp;
+        };
+
+        List<WalkForwardMetric<String, Boolean>> metrics = List.of(
+                WalkForwardMetric.agreement("eventAgreement", 1, (prediction, outcome) -> outcome),
+                WalkForwardMetric.topKHitRate("top2Hit", 2, (prediction, outcome) -> outcome),
+                WalkForwardMetric.brierScore("brier", 1, outcome -> outcome ? numFactory.one() : numFactory.zero()));
+
+        WalkForwardEngine<String, String, Boolean> engine = new WalkForwardEngine<>(
+                new AnchoredExpandingWalkForwardSplitter(), provider, labeler, metrics, ignored -> {
+                    // no-op
+                }, auditRecords::add);
+
+        WalkForwardRunResult<String, Boolean> first = engine.run(series, "ctx", config);
+        WalkForwardRunResult<String, Boolean> second = engine.run(series, "ctx", config);
+
+        assertThat(first.splits()).isNotEmpty();
+        assertThat(first.snapshots()).isNotEmpty();
+        assertThat(first.observationsByHorizon().get(5)).isNotEmpty();
+        assertThat(first.globalMetricsForHorizon(5)).containsKeys("eventAgreement", "top2Hit", "brier");
+        assertThat(first.foldMetricsForHorizon(5)).isNotEmpty();
+        assertThat(first.runtimeReport().overallRuntime()).isNotNull();
+        assertThat(first.runtimeReport().foldRuntimes()).isNotEmpty();
+        assertThat(first.runtimeReport().foldRuntimes()).allSatisfy(fold -> {
+            assertThat(fold.snapshotCount()).isEqualTo(fold.snapshotRuntimes().size());
+            assertThat(fold.snapshotRuntimes()).isNotEmpty();
+            assertThat(fold.maxSnapshotRuntime()).isGreaterThanOrEqualTo(fold.minSnapshotRuntime());
+        });
+        assertThat(first.runtimeReport()
+                .foldRuntimes()
+                .stream()
+                .flatMap(fold -> fold.snapshotRuntimes().stream())
+                .map(WalkForwardRuntimeReport.SnapshotRuntime::predictionCount)).allMatch(count -> count == 2);
+        assertThat(first.manifest().configHash()).isEqualTo(config.configHash());
+
+        assertThat(auditRecords).isNotEmpty();
+        for (WalkForwardRunResult.LeakageAudit audit : auditRecords) {
+            assertThat(audit.visibleEndIndex()).isEqualTo(audit.decisionIndex());
+            assertThat(audit.labelStartIndex()).isEqualTo(audit.decisionIndex() + 1);
+        }
+
+        assertThat(second.snapshots().size()).isEqualTo(first.snapshots().size());
+        assertThat(second.globalMetricsByHorizon()).isEqualTo(first.globalMetricsByHorizon());
+        assertThat(second.foldMetricsByHorizon()).isEqualTo(first.foldMetricsByHorizon());
+    }
+
+    @Test
+    void engineExposesFoldBoundedLabelWindowSkips() {
+        BarSeries series = new MockBarSeriesBuilder().withData(prices(120)).build();
+        WalkForwardConfig config = new WalkForwardConfig(60, 20, 20, 0, 0, 0, 15, List.of(), 1, List.of(), 1L);
+
+        WalkForwardEngine<String, String, Boolean> engine = new WalkForwardEngine<>(
+                new AnchoredExpandingWalkForwardSplitter(),
+                (fullSeries, decisionIndex,
+                        context) -> List.of(new RankedPrediction<>("p", 1, fullSeries.numFactory().numOf(0.5),
+                                fullSeries.numFactory().numOf(0.5), "p")),
+                (fullSeries, decisionIndex, horizonBars, prediction) -> true,
+                List.of(WalkForwardMetric.agreement("agreement", 1, (prediction, outcome) -> outcome)));
+
+        WalkForwardRunResult<String, Boolean> result = engine.run(series, "ctx", config);
+
+        long skipped = result.leakageAudit().stream().filter(audit -> !audit.withinFoldBounds()).count();
+        assertThat(skipped).isGreaterThan(0);
+        assertThat(result.observationsByHorizon().get(15)).isNotEmpty();
+    }
+
+    @Test
+    void engineProducesTheSameSnapshotsMetricsAndAuditsWhenFoldsRunInParallel() {
+        BarSeries series = new MockBarSeriesBuilder().withData(prices(220)).build();
+        NumFactory numFactory = series.numFactory();
+        WalkForwardConfig config = new WalkForwardConfig(80, 30, 30, 2, 2, 0, 5, List.of(3), 2, List.of(1), 7L);
+
+        PredictionProvider<String, String> provider = (fullSeries, decisionIndex,
+                context) -> samplePredictions(numFactory, context);
+
+        OutcomeLabeler<String, Boolean> labeler = (fullSeries, decisionIndex, horizonBars, prediction) -> {
+            double start = fullSeries.getBar(decisionIndex).getClosePrice().doubleValue();
+            double end = fullSeries.getBar(decisionIndex + horizonBars).getClosePrice().doubleValue();
+            boolean movedUp = end > start;
+            return "bull".equals(prediction.payload()) ? movedUp : !movedUp;
+        };
+
+        List<WalkForwardMetric<String, Boolean>> metrics = List.of(
+                WalkForwardMetric.agreement("eventAgreement", 1, (prediction, outcome) -> outcome),
+                WalkForwardMetric.topKHitRate("top2Hit", 2, (prediction, outcome) -> outcome),
+                WalkForwardMetric.brierScore("brier", 1, outcome -> outcome ? numFactory.one() : numFactory.zero()));
+
+        List<WalkForwardRunResult.LeakageAudit> serialAudit = new ArrayList<>();
+        WalkForwardEngine<String, String, Boolean> serialEngine = new WalkForwardEngine<>(
+                new AnchoredExpandingWalkForwardSplitter(), provider, labeler, metrics, ignored -> {
+                    // no-op
+                }, serialAudit::add);
+
+        List<WalkForwardRunResult.LeakageAudit> parallelAudit = new ArrayList<>();
+        AtomicInteger inFlightProviders = new AtomicInteger();
+        AtomicInteger probeSlots = new AtomicInteger();
+        AtomicBoolean overlapDetected = new AtomicBoolean();
+        CountDownLatch probeRelease = new CountDownLatch(1);
+        PredictionProvider<String, String> parallelProvider = (fullSeries, decisionIndex, context) -> {
+            int activeProviders = inFlightProviders.incrementAndGet();
+            int probeSlot = probeSlots.getAndIncrement();
+            try {
+                if (activeProviders > 1) {
+                    overlapDetected.set(true);
+                    probeRelease.countDown();
+                }
+                if (probeSlot < 2) {
+                    probeRelease.await(500, TimeUnit.MILLISECONDS);
+                }
+                return samplePredictions(numFactory, context);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new IllegalStateException("parallel overlap probe interrupted", e);
+            } finally {
+                inFlightProviders.decrementAndGet();
+            }
+        };
+        WalkForwardEngine<String, String, Boolean> parallelEngine = new WalkForwardEngine<>(
+                new AnchoredExpandingWalkForwardSplitter(), parallelProvider, labeler, metrics, ignored -> {
+                    // no-op
+                }, parallelAudit::add, 3);
+
+        WalkForwardRunResult<String, Boolean> serial = serialEngine.run(series, "ctx", config);
+        WalkForwardRunResult<String, Boolean> parallel = parallelEngine.run(series, "ctx", config);
+
+        assertThat(parallel.splits()).isEqualTo(serial.splits());
+        assertThat(parallel.snapshots()).isEqualTo(serial.snapshots());
+        assertThat(parallel.observationsByHorizon()).isEqualTo(serial.observationsByHorizon());
+        assertThat(parallel.globalMetricsByHorizon()).isEqualTo(serial.globalMetricsByHorizon());
+        assertThat(parallel.foldMetricsByHorizon()).isEqualTo(serial.foldMetricsByHorizon());
+        assertThat(parallel.leakageAudit()).isEqualTo(serial.leakageAudit());
+        assertThat(parallel.manifest()).isEqualTo(serial.manifest());
+        assertThat(parallelAudit).isEqualTo(serialAudit);
+        assertThat(overlapDetected).isTrue();
+        assertThat(parallel.runtimeReport()
+                .foldRuntimes()
+                .stream()
+                .map(fold -> fold.foldId() + ":" + fold.snapshotCount()))
+                .isEqualTo(serial.runtimeReport()
+                        .foldRuntimes()
+                        .stream()
+                        .map(fold -> fold.foldId() + ":" + fold.snapshotCount())
+                        .toList());
+    }
+
+    @Test
+    void parallelFoldFailuresAreRecordedAndDoNotAbortRun() {
+        BarSeries series = new MockBarSeriesBuilder().withData(prices(220)).build();
+        WalkForwardConfig config = new WalkForwardConfig(80, 30, 30, 2, 2, 0, 5, List.of(3), 2, List.of(1), 7L);
+
+        WalkForwardEngine<String, String, Boolean> engine = new WalkForwardEngine<>(
+                new AnchoredExpandingWalkForwardSplitter(), (fullSeries, decisionIndex, context) -> {
+                    throw new IllegalArgumentException("synthetic provider failure");
+                }, (fullSeries, decisionIndex, horizonBars, prediction) -> true,
+                List.of(WalkForwardMetric.agreement("agreement", 1, (prediction, outcome) -> outcome)), ignored -> {
+                    // no-op
+                }, ignored -> {
+                    // no-op
+                }, 3);
+
+        WalkForwardRunResult<String, Boolean> result = engine.run(series, "ctx", config);
+
+        assertThat(result.foldFailures()).isNotEmpty();
+        assertThat(result.foldFailures())
+                .allSatisfy(failure -> assertThat(failure.cause()).isInstanceOf(IllegalArgumentException.class)
+                        .hasMessage("synthetic provider failure"));
+        assertThat(result.foldMetricsForHorizon(5)).isEmpty();
+        // Every fold failed, but the run still consumed wall-clock time: the
+        // overall runtime must be retained even with zero fold runtimes.
+        assertThat(result.runtimeReport().foldRuntimes()).isEmpty();
+        assertThat(result.runtimeReport().overallRuntime().isZero()).isFalse();
+    }
+
+    @Test
+    void engineContinuesPastFoldFailureAndStreamsRemainingProgress() {
+        BarSeries series = new MockBarSeriesBuilder().withData(prices(120)).build();
+        WalkForwardConfig config = new WalkForwardConfig(60, 20, 20, 0, 0, 0, 5, List.of(), 1, List.of(), 1L);
+        AtomicInteger invocationCount = new AtomicInteger();
+        List<Integer> progress = new ArrayList<>();
+
+        WalkForwardEngine<String, String, Boolean> engine = new WalkForwardEngine<>(
+                new AnchoredExpandingWalkForwardSplitter(), (fullSeries, decisionIndex, context) -> {
+                    if (invocationCount.incrementAndGet() == 5) {
+                        throw new IllegalStateException("synthetic prediction failure");
+                    }
+                    return List.of(new RankedPrediction<>("p-" + decisionIndex, 1, fullSeries.numFactory().numOf(0.5),
+                            fullSeries.numFactory().numOf(0.5), "bull"));
+                }, (fullSeries, decisionIndex, horizonBars, prediction) -> true,
+                List.of(WalkForwardMetric.agreement("agreement", 1, (prediction, outcome) -> outcome)), progress::add,
+                ignored -> {
+                    // no-op
+                });
+
+        WalkForwardRunResult<String, Boolean> result = engine.run(series, "ctx", config);
+
+        assertThat(result.foldFailures()).hasSize(1);
+        assertThat(result.foldFailures().get(0).cause()).isInstanceOf(IllegalStateException.class)
+                .hasMessage("synthetic prediction failure");
+        assertThat(progress).isNotEmpty();
+        assertThat(progress.size()).isGreaterThan(4);
+        assertThat(progress).isSorted();
+    }
+
+    @Test
+    void isolatesFailingFoldAndPreservesHealthyFoldResults() {
+        BarSeries series = new MockBarSeriesBuilder().withData(prices(220)).build();
+        NumFactory numFactory = series.numFactory();
+        WalkForwardConfig config = new WalkForwardConfig(80, 30, 30, 2, 2, 0, 5, List.of(3), 2, List.of(1), 7L);
+        WalkForwardSplitter splitter = new AnchoredExpandingWalkForwardSplitter();
+        List<WalkForwardSplit> splits = splitter.split(series, config);
+        int failingDecisionIndex = splits.get(1).testStart();
+
+        WalkForwardEngine<String, String, Boolean> engine = new WalkForwardEngine<>(splitter,
+                (fullSeries, decisionIndex, context) -> {
+                    if (decisionIndex == failingDecisionIndex) {
+                        throw new IllegalStateException("synthetic fold-2 provider failure");
+                    }
+                    return samplePredictions(numFactory, context);
+                }, (fullSeries, decisionIndex, horizonBars, prediction) -> true,
+                List.of(WalkForwardMetric.agreement("agreement", 1, (prediction, outcome) -> outcome)), ignored -> {
+                    // no-op
+                }, ignored -> {
+                    // no-op
+                }, 3);
+
+        WalkForwardRunResult<String, Boolean> result = engine.run(series, "ctx", config);
+
+        assertThat(result.foldFailures()).hasSize(1);
+        WalkForwardRunResult.FoldFailure failure = result.foldFailures().get(0);
+        assertThat(failure.foldId()).isEqualTo(splits.get(1).foldId());
+        assertThat(failure.foldOrder()).isEqualTo(1);
+        assertThat(failure.cause()).isInstanceOf(IllegalStateException.class)
+                .hasMessage("synthetic fold-2 provider failure");
+
+        assertThat(result.foldMetricsForHorizon(5)).containsKeys(splits.get(0).foldId(), splits.get(2).foldId());
+        assertThat(result.foldMetricsForHorizon(5)).doesNotContainKey(splits.get(1).foldId());
+        assertThat(result.snapshots()).isNotEmpty();
+    }
+
+    @Test
+    void progressCallbackFailurePropagatesFromSequentialFolds() {
+        BarSeries series = new MockBarSeriesBuilder().withData(prices(120)).build();
+        WalkForwardConfig config = new WalkForwardConfig(60, 20, 20, 0, 0, 0, 15, List.of(), 1, List.of(), 1L);
+
+        WalkForwardEngine<String, String, Boolean> engine = new WalkForwardEngine<>(
+                new AnchoredExpandingWalkForwardSplitter(),
+                (fullSeries, decisionIndex,
+                        context) -> List.of(new RankedPrediction<>("p", 1, fullSeries.numFactory().numOf(0.5),
+                                fullSeries.numFactory().numOf(0.5), "p")),
+                (fullSeries, decisionIndex, horizonBars, prediction) -> true,
+                List.of(WalkForwardMetric.agreement("agreement", 1, (prediction, outcome) -> outcome)), ignored -> {
+                    throw new IllegalStateException("callback failure");
+                }, ignored -> {
+                    // no-op
+                });
+
+        assertThatThrownBy(() -> engine.run(series, "ctx", config)).isInstanceOf(IllegalStateException.class)
+                .hasMessage("callback failure");
+    }
+
+    @Test
+    void progressCallbackFailurePropagatesFromParallelFolds() {
+        BarSeries series = new MockBarSeriesBuilder().withData(prices(120)).build();
+        WalkForwardConfig config = new WalkForwardConfig(60, 20, 20, 0, 0, 0, 15, List.of(), 1, List.of(), 1L);
+
+        WalkForwardEngine<String, String, Boolean> engine = new WalkForwardEngine<>(
+                new AnchoredExpandingWalkForwardSplitter(),
+                (fullSeries, decisionIndex,
+                        context) -> List.of(new RankedPrediction<>("p", 1, fullSeries.numFactory().numOf(0.5),
+                                fullSeries.numFactory().numOf(0.5), "p")),
+                (fullSeries, decisionIndex, horizonBars, prediction) -> true,
+                List.of(WalkForwardMetric.agreement("agreement", 1, (prediction, outcome) -> outcome)), ignored -> {
+                    throw new IllegalStateException("callback failure");
+                }, ignored -> {
+                    // no-op
+                }, 2);
+
+        assertThatThrownBy(() -> engine.run(series, "ctx", config)).isInstanceOf(IllegalStateException.class)
+                .hasMessage("callback failure");
+    }
+
+    private static double[] prices(int size) {
+        double[] prices = new double[size];
+        for (int i = 0; i < size; i++) {
+            prices[i] = 100 + (i * 0.5);
+        }
+        return prices;
+    }
+
+    private static List<RankedPrediction<String>> samplePredictions(NumFactory numFactory, String context) {
+        return List.of(
+                new RankedPrediction<>(context + "-bull", 1, numFactory.numOf(0.7), numFactory.numOf(0.8), "bull"),
+                new RankedPrediction<>(context + "-bear", 2, numFactory.numOf(0.3), numFactory.numOf(0.4), "bear"));
+    }
+}

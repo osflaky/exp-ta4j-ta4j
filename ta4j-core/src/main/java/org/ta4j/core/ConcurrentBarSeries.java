@@ -1,0 +1,1014 @@
+/*
+ * SPDX-License-Identifier: MIT
+ */
+package org.ta4j.core;
+
+import org.ta4j.core.bars.TimeBarBuilderFactory;
+import org.ta4j.core.num.DecimalNumFactory;
+import org.ta4j.core.num.NumFactory;
+import org.ta4j.core.num.Num;
+
+import java.io.ObjectInputStream;
+import java.io.IOException;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
+import java.util.concurrent.locks.ReadWriteLock;
+import java.util.concurrent.locks.Lock;
+import java.util.function.Supplier;
+import java.util.Collection;
+import java.util.Comparator;
+import java.util.ArrayList;
+import java.util.Objects;
+import java.time.Duration;
+import java.time.Instant;
+import java.util.List;
+import java.util.IdentityHashMap;
+import java.util.Iterator;
+
+/**
+ * Thread-safe {@link BarSeries} implementation for concurrent read/write use
+ * cases.
+ *
+ * <p>
+ * Choose this type only when ingestion and evaluation can overlap on different
+ * threads. For single-threaded backtests and deterministic replay pipelines,
+ * {@link BaseBarSeries} is usually simpler.
+ * </p>
+ *
+ * <p>
+ * For real-time data feeds, prefer {@link #ingestTrade(Instant, Num, Num)} and
+ * {@link #ingestTrade(Instant, Number, Number)} to let the configured
+ * {@link BarBuilder} handle bar rollovers. Direct bar mutations remain
+ * available for reconciliation and data correction workflows.
+ *
+ * <p>
+ * Java serialization preserves bar data, the {@link NumFactory}, and the
+ * {@link BarBuilderFactory} configuration. Transient locks are reinitialized on
+ * deserialization, and the trade bar builder is recreated lazily on the next
+ * ingestion call.
+ *
+ * @since 0.22.2
+ */
+public class ConcurrentBarSeries extends BaseBarSeries {
+
+    private static final long serialVersionUID = -1868546230609071876L;
+    private static final ThreadLocal<DeferredRetainedMutationCallbacks> DEFERRED_RETAINED_MUTATION_CALLBACKS = new ThreadLocal<>();
+    private transient Lock readLock;
+    private transient Lock writeLock;
+
+    private transient BarBuilder tradeBarBuilder;
+
+    /**
+     * Indicates how a streaming bar was applied to the series.
+     *
+     * @since 0.22.2
+     */
+    public enum StreamingBarIngestAction {
+        APPENDED, REPLACED_LAST, REPLACED_HISTORICAL
+    }
+
+    /**
+     * Describes the outcome of ingesting a streaming bar.
+     *
+     * @param action indicates how the bar was applied
+     * @param index  the affected series index
+     *
+     * @since 0.22.2
+     */
+    public record StreamingBarIngestResult(StreamingBarIngestAction action, int index) {
+        public StreamingBarIngestResult {
+            Objects.requireNonNull(action, "action cannot be null");
+            if (index < 0) {
+                throw new IllegalArgumentException("index cannot be negative");
+            }
+        }
+    }
+
+    ConcurrentBarSeries(final String name, final List<Bar> bars) {
+        this(name, bars, 0, bars.size() - 1, false, DecimalNumFactory.getInstance(), new TimeBarBuilderFactory(true),
+                new ReentrantReadWriteLock());
+    }
+
+    ConcurrentBarSeries(final String name, final List<Bar> bars, final int seriesBeginIndex, final int seriesEndIndex,
+            final boolean constrained, final NumFactory numFactory, final BarBuilderFactory barBuilderFactory) {
+        this(name, bars, seriesBeginIndex, seriesEndIndex, constrained, numFactory, barBuilderFactory,
+                new ReentrantReadWriteLock());
+    }
+
+    ConcurrentBarSeries(final String name, final List<Bar> bars, final int seriesBeginIndex, final int seriesEndIndex,
+            final int removedBarsCount, final boolean constrained, final NumFactory numFactory,
+            final BarBuilderFactory barBuilderFactory) {
+        super(name, bars, seriesBeginIndex, seriesEndIndex, removedBarsCount, constrained, numFactory,
+                barBuilderFactory);
+        initLocks(new ReentrantReadWriteLock());
+        attachRetainedBarMutationTracking();
+        this.tradeBarBuilder = Objects.requireNonNull(super.barBuilder(), "barBuilder cannot be null");
+    }
+
+    ConcurrentBarSeries(final String name, final List<Bar> bars, final int seriesBeginIndex, final int seriesEndIndex,
+            final boolean constrained, final NumFactory numFactory, final BarBuilderFactory barBuilderFactory,
+            final ReadWriteLock readWriteLock) {
+        super(name, bars, seriesBeginIndex, seriesEndIndex, constrained, numFactory, barBuilderFactory);
+        initLocks(readWriteLock);
+        attachRetainedBarMutationTracking();
+        this.tradeBarBuilder = Objects.requireNonNull(super.barBuilder(), "barBuilder cannot be null");
+    }
+
+    private void initLocks(final ReadWriteLock readWriteLock) {
+        ReadWriteLock rwLock = Objects.requireNonNull(readWriteLock, "readWriteLock cannot be null");
+        this.readLock = rwLock.readLock();
+        this.writeLock = rwLock.writeLock();
+    }
+
+    private void readObject(final ObjectInputStream in) throws IOException, ClassNotFoundException {
+        in.defaultReadObject();
+        initLocks(new ReentrantReadWriteLock());
+        attachRetainedBarMutationTracking();
+        tradeBarBuilder = null;
+    }
+
+    private static List<Bar> cut(final List<Bar> bars, final int startIndex, final int endIndex) {
+        return new ArrayList<>(bars.subList(startIndex, endIndex));
+    }
+
+    @Override
+    public ConcurrentBarSeries getSubSeries(final int startIndex, final int endIndex) {
+        this.readLock.lock();
+        try {
+            if (startIndex < 0) {
+                throw new IllegalArgumentException(String.format("startIndex: %s cannot be negative", startIndex));
+            }
+            if (startIndex >= endIndex) {
+                throw new IllegalArgumentException(
+                        String.format("endIndex: %s must be greater than startIndex: %s", endIndex, startIndex));
+            }
+            final List<Bar> bars = super.getBarData();
+            if (!bars.isEmpty()) {
+                final int retainedStartIndex = Math.max(startIndex, super.getBeginIndex());
+                final int start = retainedStartIndex - super.getRemovedBarsCount();
+                final int end = Math.min(endIndex - super.getRemovedBarsCount(), super.getEndIndex() + 1);
+                final var builder = new ConcurrentBarSeriesBuilder().withName(getName())
+                        .withBars(cut(bars, start, end))
+                        .withBeginIndex(super.getRemovedBarsCount() > 0 ? retainedStartIndex : 0)
+                        .withNumFactory(super.numFactory())
+                        .withBarBuilderFactory(super.barBuilderFactory());
+                if (!isConstrained()) {
+                    builder.withMaxBarCount(super.getMaximumBarCount());
+                }
+                return builder.build();
+            }
+            final var builder = new ConcurrentBarSeriesBuilder().withNumFactory(super.numFactory())
+                    .withBarBuilderFactory(super.barBuilderFactory())
+                    .withName(getName());
+            if (!isConstrained()) {
+                builder.withMaxBarCount(super.getMaximumBarCount());
+            }
+            return builder.build();
+        } finally {
+            this.readLock.unlock();
+        }
+    }
+
+    @Override
+    public BarBuilder barBuilder() {
+        this.readLock.lock();
+        try {
+            return super.barBuilder();
+        } finally {
+            this.readLock.unlock();
+        }
+    }
+
+    @Override
+    public String getName() {
+        this.readLock.lock();
+        try {
+            return super.getName();
+        } finally {
+            this.readLock.unlock();
+        }
+    }
+
+    @Override
+    public NumFactory numFactory() {
+        this.readLock.lock();
+        try {
+            return super.numFactory();
+        } finally {
+            this.readLock.unlock();
+        }
+    }
+
+    @Override
+    public Bar getBar(final int i) {
+        this.readLock.lock();
+        try {
+            return super.getBar(i);
+        } finally {
+            this.readLock.unlock();
+        }
+    }
+
+    @Override
+    public Bar getFirstBar() {
+        this.readLock.lock();
+        try {
+            return super.getBar(super.getBeginIndex());
+        } finally {
+            this.readLock.unlock();
+        }
+    }
+
+    @Override
+    public Bar getLastBar() {
+        this.readLock.lock();
+        try {
+            return super.getBar(super.getEndIndex());
+        } finally {
+            this.readLock.unlock();
+        }
+    }
+
+    @Override
+    public int getBarCount() {
+        this.readLock.lock();
+        try {
+            return super.getBarCount();
+        } finally {
+            this.readLock.unlock();
+        }
+    }
+
+    @Override
+    public List<Bar> getBarData() {
+        this.readLock.lock();
+        try {
+            return List.copyOf(super.getBarData());
+        } finally {
+            this.readLock.unlock();
+        }
+    }
+
+    /**
+     * {@inheritDoc}
+     *
+     * @since 0.23.1
+     */
+    @Override
+    public long getBarHistoryRevision() {
+        this.readLock.lock();
+        try {
+            return super.getBarHistoryRevision();
+        } finally {
+            this.readLock.unlock();
+        }
+    }
+
+    /**
+     * {@inheritDoc}
+     *
+     * @since 0.24.1
+     */
+    @Override
+    public BarSeriesChangeSnapshot getBarSeriesChangeSnapshot(final long sinceRevision) {
+        this.readLock.lock();
+        try {
+            return super.getBarSeriesChangeSnapshot(sinceRevision);
+        } finally {
+            this.readLock.unlock();
+        }
+    }
+
+    /**
+     * {@inheritDoc}
+     *
+     * @since 0.22.9
+     */
+    @Override
+    public void clear() {
+        this.writeLock.lock();
+        try {
+            super.clear();
+            this.tradeBarBuilder = null;
+        } finally {
+            this.writeLock.unlock();
+        }
+    }
+
+    @Override
+    public int getBeginIndex() {
+        this.readLock.lock();
+        try {
+            return super.getBeginIndex();
+        } finally {
+            this.readLock.unlock();
+        }
+    }
+
+    @Override
+    public int getEndIndex() {
+        this.readLock.lock();
+        try {
+            return super.getEndIndex();
+        } finally {
+            this.readLock.unlock();
+        }
+    }
+
+    @Override
+    public int getMaximumBarCount() {
+        this.readLock.lock();
+        try {
+            return super.getMaximumBarCount();
+        } finally {
+            this.readLock.unlock();
+        }
+    }
+
+    @Override
+    public void setMaximumBarCount(final int maximumBarCount) {
+        this.writeLock.lock();
+        try {
+            super.setMaximumBarCount(maximumBarCount);
+        } finally {
+            this.writeLock.unlock();
+        }
+    }
+
+    @Override
+    public int getRemovedBarsCount() {
+        this.readLock.lock();
+        try {
+            return super.getRemovedBarsCount();
+        } finally {
+            this.readLock.unlock();
+        }
+    }
+
+    /**
+     * Returns the builder used for streaming trade ingestion. Configure it (for
+     * example, set the time period) before calling
+     * {@link #ingestTrade(Instant, Num, Num)}.
+     *
+     * @return the trade bar builder
+     *
+     * @since 0.22.2
+     */
+    public BarBuilder tradeBarBuilder() {
+        return new LockedTradeBarBuilder();
+    }
+
+    private BarBuilder tradeBarBuilderUnsafe() {
+        if (tradeBarBuilder == null) {
+            tradeBarBuilder = Objects.requireNonNull(super.barBuilder(), "barBuilder cannot be null");
+        }
+        return tradeBarBuilder;
+    }
+
+    /**
+     * Runs the supplied action while holding the read lock.
+     *
+     * @param action read-only action to execute
+     *
+     * @since 0.22.2
+     */
+    public void withReadLock(final Runnable action) {
+        Objects.requireNonNull(action, "action cannot be null");
+        this.readLock.lock();
+        try {
+            action.run();
+        } finally {
+            this.readLock.unlock();
+        }
+    }
+
+    /**
+     * Runs the supplied action while holding the read lock.
+     *
+     * @param action read-only action to execute
+     * @param <T>    return type
+     * @return the action result
+     *
+     * @since 0.22.2
+     */
+    public <T> T withReadLock(final Supplier<T> action) {
+        Objects.requireNonNull(action, "action cannot be null");
+        this.readLock.lock();
+        try {
+            return action.get();
+        } finally {
+            this.readLock.unlock();
+        }
+    }
+
+    /**
+     * Runs the supplied action while holding the write lock. Retained-bar callbacks
+     * triggered by the action publish on this series before unlock; callbacks for
+     * peer series run after the outermost write lease is released.
+     *
+     * @param action mutating action to execute
+     *
+     * @since 0.22.2
+     */
+    public void withWriteLock(final Runnable action) {
+        Objects.requireNonNull(action, "action cannot be null");
+        withWriteLock(() -> {
+            action.run();
+            return null;
+        });
+    }
+
+    /**
+     * Runs the supplied action while holding the write lock.
+     *
+     * @param action mutating action to execute
+     * @param <T>    return type
+     * @return the action result
+     *
+     * @since 0.22.2
+     */
+    public <T> T withWriteLock(final Supplier<T> action) {
+        Objects.requireNonNull(action, "action cannot be null");
+        this.writeLock.lock();
+        final DeferredRetainedMutationCallbacks callbacks = beginDeferredRetainedMutationCallbacks(this);
+        final boolean outermost = callbacks.isOutermost(this);
+        Throwable failure = null;
+        Throwable localCallbackFailure = null;
+        try {
+            return action.get();
+        } catch (RuntimeException | Error cause) {
+            failure = cause;
+            throw cause;
+        } finally {
+            if (outermost) {
+                localCallbackFailure = flushLocalRetainedMutationCallbacks(callbacks);
+            }
+            this.writeLock.unlock();
+            completeDeferredRetainedMutationCallbacks(callbacks, this, failure, localCallbackFailure);
+        }
+    }
+
+    /**
+     * Serializes direct retained-bar callbacks with structural mutations.
+     * {@link BaseBar} releases its retaining-series monitor before invoking this
+     * method, so acquiring the write lock here cannot invert the attachment lock
+     * order.
+     */
+    @Override
+    void retainedBarMutated(final BaseBar bar, final int index) {
+        final DeferredRetainedMutationCallbacks callbacks = DEFERRED_RETAINED_MUTATION_CALLBACKS.get();
+        if (callbacks != null) {
+            callbacks.defer(this, bar, index);
+            return;
+        }
+        this.writeLock.lock();
+        try {
+            super.retainedBarMutated(bar, index);
+        } finally {
+            this.writeLock.unlock();
+        }
+    }
+
+    private static DeferredRetainedMutationCallbacks beginDeferredRetainedMutationCallbacks(
+            final ConcurrentBarSeries series) {
+        DeferredRetainedMutationCallbacks callbacks = DEFERRED_RETAINED_MUTATION_CALLBACKS.get();
+        if (callbacks == null) {
+            callbacks = new DeferredRetainedMutationCallbacks();
+            DEFERRED_RETAINED_MUTATION_CALLBACKS.set(callbacks);
+        }
+        callbacks.enter(series);
+        return callbacks;
+    }
+
+    private Throwable flushLocalRetainedMutationCallbacks(final DeferredRetainedMutationCallbacks callbacks) {
+        Throwable callbackFailure = null;
+        final Iterator<RetainedMutationCallback> iterator = callbacks.callbacks().iterator();
+        while (iterator.hasNext()) {
+            final RetainedMutationCallback callback = iterator.next();
+            if (callback.series() != this) {
+                continue;
+            }
+            iterator.remove();
+            try {
+                super.retainedBarMutated(callback.bar(), callback.index());
+            } catch (RuntimeException | Error cause) {
+                if (callbackFailure == null) {
+                    callbackFailure = cause;
+                } else {
+                    callbackFailure.addSuppressed(cause);
+                }
+            }
+        }
+        return callbackFailure;
+    }
+
+    private static void completeDeferredRetainedMutationCallbacks(final DeferredRetainedMutationCallbacks callbacks,
+            final ConcurrentBarSeries series, final Throwable actionFailure, final Throwable localCallbackFailure) {
+        final boolean outermost = callbacks.leave(series);
+        if (!outermost) {
+            propagateCallbackFailure(localCallbackFailure, actionFailure);
+            return;
+        }
+        DEFERRED_RETAINED_MUTATION_CALLBACKS.remove();
+        Throwable callbackFailure = localCallbackFailure;
+        for (RetainedMutationCallback callback : callbacks.callbacks()) {
+            try {
+                callback.series().retainedBarMutated(callback.bar(), callback.index());
+            } catch (RuntimeException | Error cause) {
+                if (callbackFailure == null) {
+                    callbackFailure = cause;
+                } else {
+                    callbackFailure.addSuppressed(cause);
+                }
+            }
+        }
+        propagateCallbackFailure(callbackFailure, actionFailure);
+    }
+
+    private static void propagateCallbackFailure(final Throwable callbackFailure, final Throwable actionFailure) {
+        if (callbackFailure == null) {
+            return;
+        }
+        if (actionFailure != null) {
+            actionFailure.addSuppressed(callbackFailure);
+        } else if (callbackFailure instanceof RuntimeException runtimeException) {
+            throw runtimeException;
+        } else {
+            throw (Error) callbackFailure;
+        }
+    }
+
+    /**
+     * {@inheritDoc}
+     * <p>
+     * Acquires the write lock so live bar restatements cannot interleave with
+     * concurrent series access.
+     *
+     * @since 0.22.9
+     */
+    @Override
+    public void replaceBar(final int index, final Bar bar) {
+        this.writeLock.lock();
+        try {
+            super.replaceBar(index, bar);
+        } finally {
+            this.writeLock.unlock();
+        }
+    }
+
+    @Override
+    public void addBar(final Bar bar, final boolean replace) {
+        this.writeLock.lock();
+        try {
+            super.addBar(bar, replace);
+        } finally {
+            this.writeLock.unlock();
+        }
+    }
+
+    @Override
+    public void addTrade(final Number tradeVolume, final Number tradePrice) {
+        addTrade(numFactory().numOf(tradeVolume), numFactory().numOf(tradePrice));
+    }
+
+    @Override
+    public void addTrade(final Num tradeVolume, final Num tradePrice) {
+        BaseBar.RetainedBarMutationPublication publication = null;
+        this.writeLock.lock();
+        try {
+            publication = super.mutateLastBarTrade(tradeVolume, tradePrice);
+        } finally {
+            this.writeLock.unlock();
+        }
+        if (publication != null) {
+            publication.publish();
+        }
+    }
+
+    @Override
+    public void addPrice(final Num price) {
+        BaseBar.RetainedBarMutationPublication publication = null;
+        this.writeLock.lock();
+        try {
+            publication = super.mutateLastBarPrice(price);
+        } finally {
+            this.writeLock.unlock();
+        }
+        if (publication != null) {
+            publication.publish();
+        }
+    }
+
+    /**
+     * Ingests a trade event into the series using the configured bar builder.
+     *
+     * @param tradeTime   the trade timestamp (UTC)
+     * @param tradeVolume the traded volume
+     * @param tradePrice  the traded price
+     *
+     * @since 0.22.2
+     */
+    public void ingestTrade(final Instant tradeTime, final Number tradeVolume, final Number tradePrice) {
+        ingestTrade(tradeTime, tradeVolume, tradePrice, null, null);
+    }
+
+    /**
+     * Ingests a trade event into the series using the configured bar builder.
+     *
+     * @param tradeTime   the trade timestamp (UTC)
+     * @param tradeVolume the traded volume
+     * @param tradePrice  the traded price
+     *
+     * @since 0.22.2
+     */
+    public void ingestTrade(final Instant tradeTime, final Num tradeVolume, final Num tradePrice) {
+        ingestTrade(tradeTime, tradeVolume, tradePrice, null, null);
+    }
+
+    /**
+     * Ingests a trade event into the series using the configured bar builder.
+     *
+     * @param tradeTime   the trade timestamp (UTC)
+     * @param tradeVolume the traded volume
+     * @param tradePrice  the traded price
+     * @param side        aggressor side (optional)
+     * @param liquidity   liquidity classification (optional)
+     *
+     * @since 0.22.2
+     */
+    public void ingestTrade(final Instant tradeTime, final Number tradeVolume, final Number tradePrice,
+            final RealtimeBar.Side side, final RealtimeBar.Liquidity liquidity) {
+        Objects.requireNonNull(tradeTime, "tradeTime cannot be null");
+        Objects.requireNonNull(tradeVolume, "tradeVolume cannot be null");
+        Objects.requireNonNull(tradePrice, "tradePrice cannot be null");
+        final NumFactory factory = super.numFactory();
+        ingestTrade(tradeTime, factory.numOf(tradeVolume), factory.numOf(tradePrice), side, liquidity);
+    }
+
+    /**
+     * Ingests a trade event into the series using the configured bar builder.
+     *
+     * @param tradeTime   the trade timestamp (UTC)
+     * @param tradeVolume the traded volume
+     * @param tradePrice  the traded price
+     * @param side        aggressor side (optional)
+     * @param liquidity   liquidity classification (optional)
+     *
+     * @since 0.22.2
+     */
+    public void ingestTrade(final Instant tradeTime, final Num tradeVolume, final Num tradePrice,
+            final RealtimeBar.Side side, final RealtimeBar.Liquidity liquidity) {
+        Objects.requireNonNull(tradeTime, "tradeTime cannot be null");
+        Objects.requireNonNull(tradeVolume, "tradeVolume cannot be null");
+        Objects.requireNonNull(tradePrice, "tradePrice cannot be null");
+        if (!super.numFactory().produces(tradeVolume) || !super.numFactory().produces(tradePrice)) {
+            throw new IllegalArgumentException(
+                    String.format("Cannot ingest trade with data types: %s/%s into series with datatype: %s",
+                            tradeVolume.getClass(), tradePrice.getClass(), super.numFactory().one().getClass()));
+        }
+        this.writeLock.lock();
+        try {
+            tradeBarBuilderUnsafe().addTrade(tradeTime, tradeVolume, tradePrice, side, liquidity);
+        } finally {
+            this.writeLock.unlock();
+        }
+    }
+
+    private final class LockedTradeBarBuilder implements BarBuilder {
+
+        @Override
+        public BarBuilder timePeriod(final Duration timePeriod) {
+            withWriteLock(() -> tradeBarBuilderUnsafe().timePeriod(timePeriod));
+            return this;
+        }
+
+        @Override
+        public BarBuilder beginTime(final Instant beginTime) {
+            withWriteLock(() -> tradeBarBuilderUnsafe().beginTime(beginTime));
+            return this;
+        }
+
+        @Override
+        public BarBuilder endTime(final Instant endTime) {
+            withWriteLock(() -> tradeBarBuilderUnsafe().endTime(endTime));
+            return this;
+        }
+
+        @Override
+        public BarBuilder openPrice(final Num openPrice) {
+            withWriteLock(() -> tradeBarBuilderUnsafe().openPrice(openPrice));
+            return this;
+        }
+
+        @Override
+        public BarBuilder openPrice(final Number openPrice) {
+            withWriteLock(() -> tradeBarBuilderUnsafe().openPrice(openPrice));
+            return this;
+        }
+
+        @Override
+        public BarBuilder openPrice(final String openPrice) {
+            withWriteLock(() -> tradeBarBuilderUnsafe().openPrice(openPrice));
+            return this;
+        }
+
+        @Override
+        public BarBuilder highPrice(final Number highPrice) {
+            withWriteLock(() -> tradeBarBuilderUnsafe().highPrice(highPrice));
+            return this;
+        }
+
+        @Override
+        public BarBuilder highPrice(final String highPrice) {
+            withWriteLock(() -> tradeBarBuilderUnsafe().highPrice(highPrice));
+            return this;
+        }
+
+        @Override
+        public BarBuilder highPrice(final Num highPrice) {
+            withWriteLock(() -> tradeBarBuilderUnsafe().highPrice(highPrice));
+            return this;
+        }
+
+        @Override
+        public BarBuilder lowPrice(final Num lowPrice) {
+            withWriteLock(() -> tradeBarBuilderUnsafe().lowPrice(lowPrice));
+            return this;
+        }
+
+        @Override
+        public BarBuilder lowPrice(final Number lowPrice) {
+            withWriteLock(() -> tradeBarBuilderUnsafe().lowPrice(lowPrice));
+            return this;
+        }
+
+        @Override
+        public BarBuilder lowPrice(final String lowPrice) {
+            withWriteLock(() -> tradeBarBuilderUnsafe().lowPrice(lowPrice));
+            return this;
+        }
+
+        @Override
+        public BarBuilder closePrice(final Num closePrice) {
+            withWriteLock(() -> tradeBarBuilderUnsafe().closePrice(closePrice));
+            return this;
+        }
+
+        @Override
+        public BarBuilder closePrice(final Number closePrice) {
+            withWriteLock(() -> tradeBarBuilderUnsafe().closePrice(closePrice));
+            return this;
+        }
+
+        @Override
+        public BarBuilder closePrice(final String closePrice) {
+            withWriteLock(() -> tradeBarBuilderUnsafe().closePrice(closePrice));
+            return this;
+        }
+
+        @Override
+        public BarBuilder volume(final Num volume) {
+            withWriteLock(() -> tradeBarBuilderUnsafe().volume(volume));
+            return this;
+        }
+
+        @Override
+        public BarBuilder volume(final Number volume) {
+            withWriteLock(() -> tradeBarBuilderUnsafe().volume(volume));
+            return this;
+        }
+
+        @Override
+        public BarBuilder volume(final String volume) {
+            withWriteLock(() -> tradeBarBuilderUnsafe().volume(volume));
+            return this;
+        }
+
+        @Override
+        public BarBuilder amount(final Num amount) {
+            withWriteLock(() -> tradeBarBuilderUnsafe().amount(amount));
+            return this;
+        }
+
+        @Override
+        public BarBuilder amount(final Number amount) {
+            withWriteLock(() -> tradeBarBuilderUnsafe().amount(amount));
+            return this;
+        }
+
+        @Override
+        public BarBuilder amount(final String amount) {
+            withWriteLock(() -> tradeBarBuilderUnsafe().amount(amount));
+            return this;
+        }
+
+        @Override
+        public BarBuilder trades(final long trades) {
+            withWriteLock(() -> tradeBarBuilderUnsafe().trades(trades));
+            return this;
+        }
+
+        @Override
+        public BarBuilder trades(final String trades) {
+            withWriteLock(() -> tradeBarBuilderUnsafe().trades(trades));
+            return this;
+        }
+
+        @Override
+        public void addTrade(final Instant time, final Num tradeVolume, final Num tradePrice) {
+            withWriteLock(() -> tradeBarBuilderUnsafe().addTrade(time, tradeVolume, tradePrice));
+        }
+
+        @Override
+        public void addTrade(final Instant time, final Num tradeVolume, final Num tradePrice,
+                final RealtimeBar.Side side, final RealtimeBar.Liquidity liquidity) {
+            withWriteLock(() -> tradeBarBuilderUnsafe().addTrade(time, tradeVolume, tradePrice, side, liquidity));
+        }
+
+        @Override
+        public BarBuilder bindTo(final BarSeries barSeries) {
+            withWriteLock(() -> tradeBarBuilderUnsafe().bindTo(barSeries));
+            return this;
+        }
+
+        @Override
+        public Bar build() {
+            return withWriteLock(() -> tradeBarBuilderUnsafe().build());
+        }
+
+        @Override
+        public void add() {
+            withWriteLock(() -> tradeBarBuilderUnsafe().add());
+        }
+    }
+
+    /**
+     * Ingests a single streaming bar (e.g., one emitted from an exchange WebSocket
+     * candles) and appends or replaces the matching interval.
+     *
+     * <p>
+     * Unlike {@link #addBar(Bar, boolean)}, this method can replace historical bars
+     * when exchanges replay snapshots that include prior intervals.
+     *
+     * @param bar streaming bar payload
+     * @return the applied action and affected series index
+     *
+     * @since 0.22.2
+     */
+    public StreamingBarIngestResult ingestStreamingBar(final Bar bar) {
+        Objects.requireNonNull(bar, "bar cannot be null");
+        this.writeLock.lock();
+        try {
+            return addStreamingBarUnsafe(bar);
+        } finally {
+            this.writeLock.unlock();
+        }
+    }
+
+    /**
+     * Bulk-ingests streaming bars. Incoming payloads are sorted by their end time
+     * to gracefully handle candle snapshots that are emitted with the most recent
+     * intervals first.
+     *
+     * @param bars streaming bars to ingest
+     * @return applied actions in ascending end-time order
+     *
+     * @since 0.22.2
+     */
+    public List<StreamingBarIngestResult> ingestStreamingBars(final Collection<Bar> bars) {
+        if (bars == null || bars.isEmpty()) {
+            return List.of();
+        }
+        final List<Bar> ordered = new ArrayList<>(bars);
+        ordered.removeIf(Objects::isNull);
+        if (ordered.isEmpty()) {
+            return List.of();
+        }
+        ordered.sort(Comparator.comparing(Bar::getEndTime));
+        this.writeLock.lock();
+        try {
+            final List<StreamingBarIngestResult> results = new ArrayList<>(ordered.size());
+            for (Bar bar : ordered) {
+                results.add(addStreamingBarUnsafe(bar));
+            }
+            return List.copyOf(results);
+        } finally {
+            this.writeLock.unlock();
+        }
+    }
+
+    private StreamingBarIngestResult addStreamingBarUnsafe(final Bar newBar) {
+        validateBarMatchesSeries(newBar);
+        final List<Bar> internal = super.getBarData();
+        if (internal.isEmpty()) {
+            super.addBar(newBar, false);
+            return new StreamingBarIngestResult(StreamingBarIngestAction.APPENDED, super.getEndIndex());
+        }
+        final Instant newEndTime = Objects.requireNonNull(newBar.getEndTime(), "Bar endTime cannot be null");
+        final Bar lastBar = internal.get(internal.size() - 1);
+        final Instant lastEndTime = Objects.requireNonNull(lastBar.getEndTime(), "Last bar endTime cannot be null");
+        int endTimeComparison = newEndTime.compareTo(lastEndTime);
+        if (endTimeComparison == 0) {
+            super.addBar(newBar, true);
+            return new StreamingBarIngestResult(StreamingBarIngestAction.REPLACED_LAST, super.getEndIndex());
+        }
+        if (endTimeComparison > 0) {
+            super.addBar(newBar, false);
+            return new StreamingBarIngestResult(StreamingBarIngestAction.APPENDED, super.getEndIndex());
+        }
+        final int internalIndex = findBarIndexByEndTime(internal, newEndTime);
+        if (internalIndex >= 0) {
+            final int seriesIndex = internalIndex + super.getRemovedBarsCount();
+            // Replacing a historical bar doesn't change bar count or indices, so we bypass
+            // addBar().
+            super.replaceBar(seriesIndex, newBar);
+            return new StreamingBarIngestResult(StreamingBarIngestAction.REPLACED_HISTORICAL, seriesIndex);
+        }
+        throw new IllegalArgumentException(
+                String.format("Cannot insert streaming bar ending at %s because series end time is %s",
+                        newBar.getEndTime(), lastBar.getEndTime()));
+    }
+
+    private void validateBarMatchesSeries(final Bar bar) {
+        if (!super.numFactory().produces(bar.getClosePrice())) {
+            throw new IllegalArgumentException(
+                    String.format("Cannot add Bar with data type: %s to series with datatype: %s",
+                            bar.getClosePrice().getClass(), super.numFactory().one().getClass()));
+        }
+    }
+
+    private static int findBarIndexByEndTime(final List<Bar> bars, final Instant endTime) {
+        int low = 0;
+        int high = bars.size() - 1;
+        while (low <= high) {
+            int mid = (low + high) >>> 1;
+            final Instant midTime = bars.get(mid).getEndTime();
+            int comparison = midTime.compareTo(endTime);
+            if (comparison < 0) {
+                low = mid + 1;
+            } else if (comparison > 0) {
+                high = mid - 1;
+            } else {
+                return mid;
+            }
+        }
+        return -1;
+    }
+
+    @Override
+    public String getSeriesPeriodDescription() {
+        this.readLock.lock();
+        try {
+            return super.getSeriesPeriodDescription();
+        } finally {
+            this.readLock.unlock();
+        }
+    }
+
+    @Override
+    public String getSeriesPeriodDescriptionInSystemTimeZone() {
+        this.readLock.lock();
+        try {
+            return super.getSeriesPeriodDescriptionInSystemTimeZone();
+        } finally {
+            this.readLock.unlock();
+        }
+    }
+
+    private record RetainedMutationCallback(ConcurrentBarSeries series, BaseBar bar, int index) {
+    }
+
+    private static final class DeferredRetainedMutationCallbacks {
+
+        private final List<RetainedMutationCallback> callbacks = new ArrayList<>();
+        private final IdentityHashMap<ConcurrentBarSeries, Integer> leaseNesting = new IdentityHashMap<>();
+        private int nesting;
+
+        private void enter(final ConcurrentBarSeries series) {
+            nesting++;
+            final Integer current = leaseNesting.get(series);
+            leaseNesting.put(series, current == null ? 1 : current + 1);
+        }
+
+        private boolean isOutermost(final ConcurrentBarSeries series) {
+            return leaseNesting.get(series) == 1;
+        }
+
+        private boolean leave(final ConcurrentBarSeries series) {
+            final int current = leaseNesting.get(series);
+            if (current == 1) {
+                leaseNesting.remove(series);
+            } else {
+                leaseNesting.put(series, current - 1);
+            }
+            return --nesting == 0;
+        }
+
+        private void defer(final ConcurrentBarSeries series, final BaseBar bar, final int index) {
+            callbacks.add(new RetainedMutationCallback(series, bar, index));
+        }
+
+        private List<RetainedMutationCallback> callbacks() {
+            return callbacks;
+        }
+    }
+}
