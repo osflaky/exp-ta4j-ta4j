@@ -1,0 +1,137 @@
+/*
+ * SPDX-License-Identifier: MIT
+ */
+package org.ta4j.core.indicators.statistics;
+
+import static org.ta4j.core.indicators.IndicatorSerializationRoundTripTestSupport.serializationSeries;
+import static org.ta4j.core.indicators.IndicatorSerializationRoundTripTestSupport.stableIndexes;
+
+import java.util.List;
+
+import static org.ta4j.core.TestUtils.assertNumEquals;
+
+import org.junit.Before;
+import org.junit.Test;
+import org.ta4j.core.BarSeries;
+import org.ta4j.core.Indicator;
+import org.ta4j.core.indicators.AbstractIndicatorTest;
+import org.ta4j.core.indicators.helpers.ClosePriceIndicator;
+import org.ta4j.core.mocks.MockBarSeriesBuilder;
+import org.ta4j.core.num.Num;
+import org.ta4j.core.num.NumFactory;
+
+public class StandardErrorIndicatorTest extends AbstractIndicatorTest<Indicator<Num>, Num> {
+    private BarSeries data;
+
+    public StandardErrorIndicatorTest(NumFactory numFactory) {
+        super(numFactory);
+    }
+
+    @Before
+    public void setUp() {
+        data = new MockBarSeriesBuilder().withNumFactory(numFactory)
+                .withData(10, 20, 30, 40, 50, 40, 40, 50, 40, 30, 20, 10)
+                .build();
+    }
+
+    @Test
+    public void usingBarCount5UsingClosePrice() {
+        var se = new StandardErrorIndicator(new ClosePriceIndicator(data), 5);
+
+        assertNumEquals(0, se.getValue(0));
+        assertNumEquals(3.5355, se.getValue(1));
+        assertNumEquals(4.714, se.getValue(2));
+        assertNumEquals(5.5902, se.getValue(3));
+        assertNumEquals(6.3246, se.getValue(4));
+        assertNumEquals(4.5607, se.getValue(5));
+        assertNumEquals(2.8284, se.getValue(6));
+        assertNumEquals(2.1909, se.getValue(7));
+        assertNumEquals(2.1909, se.getValue(8));
+        assertNumEquals(2.8284, se.getValue(9));
+        assertNumEquals(4.5607, se.getValue(10));
+        assertNumEquals(6.3246, se.getValue(11));
+    }
+
+    @Test
+    public void shouldBeZeroWhenBarCountIs1() {
+        var se = new StandardErrorIndicator(new ClosePriceIndicator(data), 1);
+        assertNumEquals(0, se.getValue(1));
+        assertNumEquals(0, se.getValue(3));
+    }
+
+    @Test
+    public void sampleStandardErrorCanBeRequestedExplicitly() {
+        var se = StandardErrorIndicator.ofSample(new ClosePriceIndicator(data), 5);
+
+        assertNumEquals(0, se.getValue(0));
+        assertNumEquals(5.0000, se.getValue(1));
+        assertNumEquals(5.7735, se.getValue(2));
+        assertNumEquals(6.4550, se.getValue(3));
+        assertNumEquals(7.0711, se.getValue(4));
+        assertNumEquals(5.0990, se.getValue(5));
+        assertNumEquals(3.1623, se.getValue(6));
+        assertNumEquals(2.4495, se.getValue(7));
+        assertNumEquals(2.4495, se.getValue(8));
+        assertNumEquals(3.1623, se.getValue(9));
+        assertNumEquals(5.0990, se.getValue(10));
+        assertNumEquals(7.0711, se.getValue(11));
+    }
+
+    @Test
+    public void nonPositiveBarCountFallsBackToOne() {
+        var closePrice = new ClosePriceIndicator(data);
+        var withOne = StandardErrorIndicator.ofPopulation(closePrice, 1);
+        var withZero = StandardErrorIndicator.ofPopulation(closePrice, 0);
+        var withNegative = StandardErrorIndicator.ofPopulation(closePrice, -3);
+
+        for (int i = 0; i <= 11; i++) {
+            assertNumEquals(withOne.getValue(i), withZero.getValue(i), 1.0e-12);
+            assertNumEquals(withOne.getValue(i), withNegative.getValue(i), 1.0e-12);
+        }
+    }
+
+    @Test
+    public void anchorsWindowAtBeginIndexAfterRemoval() {
+        // Evict the first four closes (1..4) so beginIndex = 4; the retained closes
+        // [5,6,7,8,9,10] live at absolute indices 4..9.
+        BarSeries pruned = new MockBarSeriesBuilder().withNumFactory(numFactory)
+                .withData(1, 2, 3, 4, 5, 6, 7, 8, 9, 10)
+                .withMaxBarCount(6)
+                .build();
+        var se = new StandardErrorIndicator(new ClosePriceIndicator(pruned), 6);
+
+        // Window [4..7] = {5,6,7,8}: sdev = sqrt(5/4), n = 4 -> sqrt(1.25) / 2
+        assertNumEquals(0.5590, se.getValue(7));
+        // Window [4..8] = {5,6,7,8,9}: sdev = sqrt(2), n = 5 -> sqrt(2) / sqrt(5)
+        assertNumEquals(0.6325, se.getValue(8));
+        // Window [4..9] = {5,6,7,8,9,10}: sdev = sqrt(17.5/6), n = 6
+        assertNumEquals(0.6972, se.getValue(9));
+    }
+
+    @Test
+    public void evictedIndexAccessRetainsFirstBarValue() {
+        // Retained closes [30,40,50,40] live at absolute indices 2..5, so indices
+        // 0 and 1 are evicted (beginIndex = 2).
+        BarSeries pruned = new MockBarSeriesBuilder().withNumFactory(numFactory)
+                .withData(10, 20, 30, 40, 50, 40)
+                .withMaxBarCount(4)
+                .build();
+        var se = new StandardErrorIndicator(new ClosePriceIndicator(pruned), 3);
+
+        // Evicted indices are served via calculate(0); the observation count must
+        // stay positive so the result is the first-bar value (0) instead of NaN
+        // from a negative sqrt argument.
+        assertNumEquals(0, se.getValue(0));
+        assertNumEquals(0, se.getValue(1));
+    }
+
+    @Override
+    protected List<IndicatorSerializationFixture<?>> serializationFixtures() {
+        BarSeries series = serializationSeries(numFactory);
+        ClosePriceIndicator close = new ClosePriceIndicator(series);
+
+        return List.of(serializationFixture(series, new StandardErrorIndicator(close, 8, SampleType.SAMPLE),
+                stableIndexes(series)));
+    }
+
+}
